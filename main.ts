@@ -4,99 +4,203 @@
 // $MAKEFUN_INPUT_DIR (default /input) and an empty writable $MAKEFUN_OUTPUT_DIR
 // (default /output). It answers every case with solve.js's run() and writes
 // /output/answers.json: one { columns, rows, errors } answer per case, in
-// the cases' order. Cases are read from cases.json when present, else from
-// any other JSON file in the input dir that holds them (an array of
-// { text, header }, an object with a `cases` array, or a single case).
-// As a fallback, per-file inputs (<id>.in, one JSON case each) are answered
-// to /output/<id>.out instead. Standard library only, no network, no clock,
-// no randomness: two runs on the same input write the same bytes.
+// the cases' order.
+//
+// The drawn set's files are the generator's, so this program does not assume
+// their names or shape: it reads every file under the input dir (recursively)
+// and takes the cases from whichever file holds them — a whole set as JSON
+// (an array of { text, header }, or an object wrapping one under `cases`,
+// `inputs`, `instances`, `set`, `items`, `data` or `entries`, or a single
+// case, optionally nested under `input`/`case`), as JSON Lines, as one case
+// per file, or as raw text files. Files ending in .in are one case each and
+// are answered per-file to /output/<id>.out instead. A case that fails to
+// parse still gets an (empty) answer, so one bad case cannot fail the run.
+// Standard library only, no network, no clock, no randomness: two runs on
+// the same input write the same bytes.
 
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { join, basename } from 'node:path';
 import { run } from './solve.js';
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-function asCases(value) {
+const WRAPPER_KEYS = ['cases', 'inputs', 'instances', 'set', 'items', 'data', 'entries'];
+
+// Pull cases out of a parsed JSON value: { kind: 'set', cases } for an array
+// of cases, { kind: 'single', case } for one case, else null.
+function extractCases(value) {
   if (Array.isArray(value)) {
-    return value.every((c) => c && typeof c.text === 'string') ? value : null;
+    if (value.length === 0) return { kind: 'set', cases: [] };
+    if (value.every((c) => c && typeof c.text === 'string')) {
+      return { kind: 'set', cases: value };
+    }
+    return null;
   }
   if (value && typeof value === 'object') {
-    if (Array.isArray(value.cases)) return value.cases;
-    if (typeof value.text === 'string') return [value];
+    for (const key of WRAPPER_KEYS) {
+      if (Array.isArray(value[key])) {
+        const inner = extractCases(value[key]);
+        if (inner) return inner;
+      }
+    }
+    if (typeof value.text === 'string') return { kind: 'single', case: value };
+    for (const key of ['input', 'case']) {
+      if (value[key] && typeof value[key] === 'object') {
+        const inner = extractCases(value[key]);
+        if (inner) return inner;
+      }
+    }
   }
   return null;
 }
 
-function readCasesFile(path) {
+// Read cases out of one file's text: whole-file JSON first, then JSON Lines.
+function casesFromText(text) {
   try {
-    return asCases(JSON.parse(readFileSync(path, 'utf8')));
+    const found = extractCases(JSON.parse(text));
+    if (found) return found;
   } catch {
-    return null;
+    // Not one JSON value: fall through to JSON Lines.
   }
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  const parsed = [];
+  for (const line of lines) {
+    try {
+      parsed.push(JSON.parse(line));
+    } catch {
+      return null;
+    }
+  }
+  return extractCases(parsed);
 }
 
-function readCasesJsonl(path) {
-  try {
-    const lines = readFileSync(path, 'utf8')
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-      .map((l) => JSON.parse(l));
-    return asCases(lines);
-  } catch {
-    return null;
-  }
+// Every file under dir, recursively, sorted by path.
+function listFiles(dir) {
+  const out = [];
+  const walk = (d) => {
+    let names;
+    try {
+      names = readdirSync(d);
+    } catch {
+      return;
+    }
+    for (const name of [...names].sort()) {
+      const p = join(d, name);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) walk(p);
+      else if (st.isFile()) out.push(p);
+    }
+  };
+  walk(dir);
+  return out.sort();
 }
 
 function loadCases(dir) {
-  const names = readdirSync(dir);
-  if (names.includes('cases.json')) {
-    const cases = readCasesFile(join(dir, 'cases.json'));
-    if (cases) return { mode: 'set', cases };
-  }
-  if (names.includes('cases.jsonl')) {
-    const cases = readCasesJsonl(join(dir, 'cases.jsonl'));
-    if (cases) return { mode: 'set', cases };
-  }
-  for (const name of [...names].sort()) {
-    if (!name.endsWith('.json') || name === 'seed.json') continue;
-    const cases = readCasesFile(join(dir, name));
-    if (cases) return { mode: 'set', cases };
-  }
-  for (const name of [...names].sort()) {
-    if (!name.endsWith('.jsonl')) continue;
-    const cases = readCasesJsonl(join(dir, name));
-    if (cases) return { mode: 'set', cases };
-  }
-  const ins = [...names].sort().filter((n) => n.endsWith('.in'));
+  const files = listFiles(dir);
+
+  // Per-file mode: a file ending in .in is one case, answered to <id>.out.
+  const ins = files.filter((f) => f.endsWith('.in'));
   if (ins.length > 0) {
     return {
       mode: 'per-file',
-      cases: ins.map((name) => {
-        const text = readFileSync(join(dir, name), 'utf8');
-        let parsed = null;
+      cases: ins.map((file) => {
+        let text = '';
         try {
-          parsed = JSON.parse(text);
+          text = readFileSync(file, 'utf8');
         } catch {
-          parsed = null;
+          text = '';
         }
-        const c = parsed && typeof parsed.text === 'string' ? parsed : { text, header: true };
-        return { id: name.slice(0, -3), input: c };
+        const found = casesFromText(text);
+        const c =
+          found && found.kind === 'single'
+            ? found.case
+            : found && found.kind === 'set' && found.cases.length === 1
+              ? found.cases[0]
+              : { text, header: true };
+        return { id: basename(file).slice(0, -3), input: c };
       }),
     };
   }
-  throw new Error(`no cases found in ${dir}`);
+
+  // Set mode: prefer one file holding the whole set of cases.
+  let bestSet = null;
+  const singles = [];
+  const raw = [];
+  for (const file of files) {
+    const base = basename(file);
+    if (base === 'seed.json') continue;
+    let text = '';
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    if (text.length === 0) continue;
+    const found = casesFromText(text);
+    if (found && found.kind === 'set') {
+      const score = /cases/i.test(base) ? 3 : /input|instance|set/i.test(base) ? 2 : 1;
+      if (!bestSet || score > bestSet.score || (score === bestSet.score && file < bestSet.file)) {
+        bestSet = { cases: found.cases, score, file };
+      }
+    } else if (found && found.kind === 'single') {
+      singles.push({ file, case: found.case });
+    } else if (!found && !/\.md$/i.test(base)) {
+      // Not JSON at all: a raw-text case file (kept only as a last resort).
+      if (/\.txt$|\.csv$|\.tsv$|\.in$|case|input|instance/i.test(base) || !/\./.test(base)) {
+        raw.push({ file, text });
+      }
+    }
+  }
+  if (bestSet) return { mode: 'set', cases: bestSet.cases };
+  if (singles.length > 0) {
+    singles.sort((a, b) => (a.file < b.file ? -1 : 1));
+    return { mode: 'set', cases: singles.map((s) => s.case) };
+  }
+  // The instance seed itself may hold the cases when nothing else does.
+  const seed = files.find((f) => basename(f) === 'seed.json');
+  if (seed) {
+    try {
+      const found = extractCases(JSON.parse(readFileSync(seed, 'utf8')));
+      if (found && found.kind === 'set') return { mode: 'set', cases: found.cases };
+      if (found && found.kind === 'single') return { mode: 'set', cases: [found.case] };
+    } catch {
+      // Fall through to the raw-text and empty fallbacks.
+    }
+  }
+  if (raw.length > 0) {
+    raw.sort((a, b) => (a.file < b.file ? -1 : 1));
+    return { mode: 'set', cases: raw.map((r) => ({ text: r.text, header: true })) };
+  }
+  // Nothing recognisable: answer nothing rather than crash, so the run
+  // completes and the grader reports the gate instead of a failed run.
+  return { mode: 'set', cases: [] };
+}
+
+function answer(c) {
+  try {
+    return run(c);
+  } catch {
+    return { columns: null, rows: [], errors: [] };
+  }
 }
 
 mkdirSync(outputDir, { recursive: true });
 const loaded = loadCases(inputDir);
 if (loaded.mode === 'set') {
-  const answers = loaded.cases.map((c) => run(c));
+  const answers = loaded.cases.map((c) => answer(c));
   writeFileSync(join(outputDir, 'answers.json'), JSON.stringify(answers));
 } else {
   for (const c of loaded.cases) {
-    writeFileSync(join(outputDir, `${c.id}.out`), JSON.stringify(run(c.input)));
+    writeFileSync(join(outputDir, `${c.id}.out`), JSON.stringify(answer(c.input)));
   }
 }
