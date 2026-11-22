@@ -56,6 +56,11 @@ function extractCases(value) {
 }
 
 // Read cases out of one file's text: whole-file JSON first, then JSON Lines.
+// The JSON Lines attempt only makes sense when lines are JSON objects, so it
+// is skipped unless the first non-whitespace character is '{'. A raw CSV/text
+// file never starts with '{'; without this guard, splitting a large raw file
+// just to throw on its first line wastes a large share of the 10 s budget
+// (a 5.6 MB raw file cost ~240 ms of loader time before this guard).
 function casesFromText(text) {
   try {
     const found = extractCases(JSON.parse(text));
@@ -63,6 +68,13 @@ function casesFromText(text) {
   } catch {
     // Not one JSON value: fall through to JSON Lines.
   }
+  let k = 0;
+  while (
+    k < text.length &&
+    (text[k] === ' ' || text[k] === '\t' || text[k] === '\n' || text[k] === '\r' || text[k] === '\uFEFF')
+  )
+    k++;
+  if (k >= text.length || text[k] !== '{') return null;
   const lines = text
     .split('\n')
     .map((l) => l.trim())

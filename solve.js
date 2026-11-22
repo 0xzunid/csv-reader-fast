@@ -25,13 +25,15 @@
 //     its record's index in rows, null for the header.
 //
 // Speed: a record whose line holds no quote is dispatched with one native
-// indexOf and split with String.split(','); a `nextQuote` cursor makes the
-// quote check O(1) per record and O(n) over the whole text (it is refreshed
-// only when the parse passes it). Unquoted fields are found with two native
+// indexOf and split with String.split(','). Three lazily-refreshed cursors
+// (first '"', '\r', '\n' at or after the parse position) make the
+// quote/CR/LF checks O(1) per field and O(n) over the whole text, so a
+// quoted field costs one indexOf scan for its close plus one slice — the
+// close scan also reports whether any "" pair was seen, so the content
+// needs no extra check for it. Unquoted fields are found with two native
 // indexOf calls, so a lone CR inside one is just stripped from its slice.
-// Quoted fields are found with indexOf scans and only processed with
-// replace() when they contain "" or CRs. No regex exec and no per-character
-// loop runs on the hot path.
+// Quoted content is only processed with replace() when it contains "" or
+// CRs. No regex exec and no per-character loop runs on the hot path.
 
 const COMMA = 44; // ,
 const QUOTE = 34; // "
@@ -54,9 +56,15 @@ export function run(input) {
   let recLine = 1; // line the record in progress starts on
   let recRow = null; // its index in rows, null for the header
   let endKind = 0; // how the last scanned segment ended: 0 comma, 1 LF, 2 CRLF, 3 EOF
-  // Index of the first '"' at or after the parse position, or -1. Refreshed
-  // only when the parse passes it, so the quote check is O(1) per record.
+  // Index of the first '"' / '\r' / '\n' at or after the parse position,
+  // or -1. Each is refreshed only when the parse passes it, so the
+  // quote/CR/LF checks are O(1) per field and O(n) over the whole text.
+  // Before a cursor is used to answer a question about a range [a, b), it
+  // must be refreshed to be at or after a: `if (c !== -1 && c < a) c =
+  // s.indexOf(ch, a)`. Then "one lies in [a, b)" is `c !== -1 && c < b`.
   let nextQuote = s.indexOf('"', i);
+  let nextCR = s.indexOf('\r', i);
+  let nextLF = s.indexOf('\n', i);
 
   // Row index an error in the record in progress carries.
   function rowNow() {
@@ -108,10 +116,15 @@ export function run(input) {
   // The field is the slice to that terminator with lone CRs dropped
   // (stray_cr each); a CR that ends the slice just before its LF is the
   // CRLF, not a stray. Sets endKind, advances i past the terminator, and
-  // returns the field.
+  // returns the field. The LF bound comes from the nextLF cursor and the
+  // CR check from the nextCR cursor, so no indexOf('\n') or indexOf('\r')
+  // scan runs here.
   function scanSegment() {
-    const dC = s.indexOf(',', i);
-    const dN = s.indexOf('\n', i);
+    const start = i;
+    if (nextLF !== -1 && nextLF < start) nextLF = s.indexOf('\n', start);
+    if (nextCR !== -1 && nextCR < start) nextCR = s.indexOf('\r', start);
+    const dC = s.indexOf(',', start);
+    const dN = nextLF;
     let m;
     let isComma;
     if (dC === -1 && dN === -1) {
@@ -125,78 +138,55 @@ export function run(input) {
       isComma = false;
     }
     if (m === -1) {
-      const seg = s.slice(i);
+      const seg = s.slice(start);
       i = n;
       endKind = 3;
-      return seg.indexOf('\r') === -1 ? seg : cleanCRs(seg);
+      // A CR in [start, n) is stray; the cursor is the first one at or
+      // after start, so one lies in range exactly when it is below n.
+      if (nextCR === -1 || nextCR >= n) return seg;
+      return cleanCRs(seg);
     }
-    const seg = s.slice(i, m);
+    const seg = s.slice(start, m);
     i = m + 1;
     if (!isComma) line++;
     endKind = isComma ? 0 : 1;
-    if (seg.indexOf('\r') === -1) return seg;
-    const isCRLF = !isComma && seg.charCodeAt(seg.length - 1) === CR;
+    // A CR in [start, m): the cursor is below m exactly then.
+    if (nextCR === -1 || nextCR >= m) return seg;
+    const isCRLF = !isComma && m > start && s.charCodeAt(m - 1) === CR;
     if (isCRLF) endKind = 2;
     const body = isCRLF ? seg.slice(0, -1) : seg;
-    return body.indexOf('\r') === -1 ? body : cleanCRs(body);
-  }
-
-  // Index of the next quote that is not doubled, at or after `from`;
-  // -1 when the field never closes.
-  function findClose(from) {
-    let j = from;
-    for (;;) {
-      const q = s.indexOf('"', j);
-      if (q === -1) return -1;
-      if (s.charCodeAt(q + 1) === QUOTE) {
-        j = q + 2;
-        continue;
-      }
-      return q;
-    }
-  }
-
-  // Turn a quoted field's raw content into its value: "" is one quote,
-  // each CRLF or lone CR is LF. Counts the line breaks it holds.
-  function quotedContent(raw) {
-    if (raw.indexOf('"') === -1 && raw.indexOf('\r') === -1) {
-      if (raw.indexOf('\n') !== -1) {
-        let count = 0;
-        let k = raw.indexOf('\n');
-        while (k !== -1) {
-          count++;
-          k = raw.indexOf('\n', k + 1);
-        }
-        line += count;
-      }
-      return raw;
-    }
-    let breaks = 0;
-    let k = raw.indexOf('\n');
-    while (k !== -1) {
-      breaks++;
-      k = raw.indexOf('\n', k + 1);
-    }
-    k = raw.indexOf('\r');
-    while (k !== -1) {
-      if (raw.charCodeAt(k + 1) !== LF) breaks++;
-      k = raw.indexOf('\r', k + 1);
-    }
-    line += breaks;
-    let out = raw;
-    if (out.indexOf('"') !== -1) out = out.replace(/""/g, '"');
-    if (out.indexOf('\r') !== -1) out = out.replace(/\r\n?/g, '\n');
-    return out;
+    // With a CRLF the only CR may be the line ending's own: one lies
+    // before it exactly when the cursor is below m - 1.
+    if (isCRLF && (nextCR === -1 || nextCR >= m - 1)) return body;
+    return cleanCRs(body);
   }
 
   // Parse one record field by field (the line holds a quote). `i` is at the
-  // record's first character; returns the record's fields.
+  // record's first character; returns the record's fields. The quoted-field
+  // close scan and its content handling are inlined here, so a quoted field
+  // costs no helper call: one indexOf scan finds the close (and reports
+  // whether any "" pair was seen), the CR/LF cursors say whether the
+  // content holds a line break, and the content is one slice.
   function parseRecordSlow() {
     const fields = [];
     for (;;) {
       let field;
       if (!replay && s.charCodeAt(i) === QUOTE) {
-        const close = findClose(i + 1);
+        // Find the closing quote: the next quote that is not doubled.
+        let close = -1;
+        let hasDoubled = false;
+        let j = i + 1;
+        for (;;) {
+          const q = s.indexOf('"', j);
+          if (q === -1) break;
+          if (s.charCodeAt(q + 1) === QUOTE) {
+            hasDoubled = true;
+            j = q + 2;
+            continue;
+          }
+          close = q;
+          break;
+        }
         if (close === -1) {
           // The quote never closes: it is literal, the rest is unquoted.
           errors.push({ code: 'unterminated_quote', line: recLine, row: recRow });
@@ -207,7 +197,43 @@ export function run(input) {
           if (endKind === 0) continue;
           return fields;
         }
-        const content = quotedContent(s.slice(i + 1, close));
+        // The content is [i + 1, close). Refresh the CR/LF cursors to its
+        // start, then their being below close says whether it holds a CR
+        // or an LF. A '"' in the content is a doubled pair exactly when the
+        // close scan saw one, so no extra check for it is needed.
+        const cs = i + 1;
+        if (nextCR !== -1 && nextCR < cs) nextCR = s.indexOf('\r', cs);
+        if (nextLF !== -1 && nextLF < cs) nextLF = s.indexOf('\n', cs);
+        const hasCR = nextCR !== -1 && nextCR < close;
+        const hasNL = nextLF !== -1 && nextLF < close;
+        let content;
+        if (!hasCR && !hasNL) {
+          content = s.slice(cs, close);
+          if (hasDoubled) content = content.replace(/""/g, '"');
+        } else {
+          // Count the line breaks the content holds: each LF, plus each
+          // CR not followed by LF. Start each count at the cursor, the
+          // first break of that kind at or after the content's start.
+          let breaks = 0;
+          if (hasNL) {
+            let k = nextLF;
+            while (k !== -1 && k < close) {
+              breaks++;
+              k = s.indexOf('\n', k + 1);
+            }
+          }
+          if (hasCR) {
+            let k = nextCR;
+            while (k !== -1 && k < close) {
+              if (s.charCodeAt(k + 1) !== LF) breaks++;
+              k = s.indexOf('\r', k + 1);
+            }
+          }
+          line += breaks;
+          content = s.slice(cs, close);
+          if (hasDoubled) content = content.replace(/""/g, '"');
+          if (hasCR) content = content.replace(/\r\n?/g, '\n');
+        }
         i = close + 1;
         // What follows the closing quote, up to the next comma or line
         // break, is junk appended as it stands. Usually there is none: the
@@ -289,7 +315,8 @@ export function run(input) {
     if (!replay && nextQuote !== -1 && nextQuote < i) {
       nextQuote = s.indexOf('"', i);
     }
-    const lf = s.indexOf('\n', i);
+    if (nextLF !== -1 && nextLF < i) nextLF = s.indexOf('\n', i);
+    const lf = nextLF;
     const end = lf === -1 ? n : lf;
     if (!replay && nextQuote !== -1 && nextQuote < end) {
       pushRecord(parseRecordSlow());
